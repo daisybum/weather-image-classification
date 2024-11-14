@@ -1,0 +1,4 @@
+pandas
+tqdm
+lion-pytorch
+--index-url https://download.pytorch.org/whl/cu118
