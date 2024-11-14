@@ -1,0 +1,24 @@
+dataset:
+  base_path: "D:/4type_weather_driving_dataset"
+  train_dir: "Training"
+  valid_dir: "Validation"
+  num_classes: 4
+  batch_size: 64
+  num_workers: 8
+
+training:
+  optimizer: "lion"
+  scheduler: "steplr"
+  scheduler_params:
+    step_size: 1
+    gamma: 0.1
+  train_ratio: 0.8
+  gpus: [2, 3, 4, 5]  # 기본 GPU 설정
+
+model:
+  name: "mobilenetv3_large"
+  pretrained: true
+
+paths:
+  checkpoints: "checkpoints"
+  logs: "logs"

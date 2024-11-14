@@ -2,173 +2,133 @@ import os
 import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torchvision import datasets
-from torch.utils.data import DataLoader, ConcatDataset, random_split
-from torch.optim.lr_scheduler import StepLR
-from torchvision.models.mobilenetv3 import mobilenet_v3_large
-from torchvision.models import MobileNet_V3_Large_Weights
-from lion_pytorch import Lion
-from PIL import ImageFile
-import logging
-from pathlib import Path
+from dotenv import load_dotenv
+from torch.cuda.amp import GradScaler
 
-from utils.transform import transform
-from run.train import ModelTrainer
+from utils.config import Config
+from run.train import DistributedModelTrainer
+from dataset_manager import DistributedDatasetManager
+from model_manager import DistributedModelManager
+from utils.setup import setup_distributed, cleanup_distributed, setup_logging
+from run.model_factory import create_model
+from run.optimizer_factory import create_optimizer, create_scheduler
 
 
-class DistributedDatasetManager:
-    """Dataset preparation and management class for distributed training."""
+def train_process(rank: int, world_size: int, config: Config):
+    """
+    Distributed training process to be run on each GPU.
 
-    def __init__(self, train_path: str, valid_path: str, batch_size: int = 64):
-        self.batch_size = batch_size
-        self.train_path = Path(train_path)
-        self.valid_path = Path(valid_path)
-        ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-    def prepare_datasets(self, train_ratio: float = 0.8):
-        """Prepare and split datasets."""
-        train_dataset = datasets.ImageFolder(root=self.train_path, transform=transform())
-        valid_dataset = datasets.ImageFolder(root=self.valid_path, transform=transform())
-        combined_dataset = ConcatDataset([train_dataset, valid_dataset])
-
-        train_size = int(len(combined_dataset) * train_ratio)
-        val_size = len(combined_dataset) - train_size
-
-        return random_split(combined_dataset, [train_size, val_size])
-
-    def create_dataloaders(self, train_dataset, val_dataset, rank, world_size):
-        """Create distributed DataLoader objects."""
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True
-        )
-
-        valid_sampler = DistributedSampler(
-            val_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            sampler=train_sampler,
-            num_workers=8,
-            pin_memory=True
-        )
-
-        valid_loader = DataLoader(
-            val_dataset,
-            batch_size=self.batch_size,
-            sampler=valid_sampler,
-            num_workers=8,
-            pin_memory=True
-        )
-
-        return train_loader, valid_loader, train_sampler, valid_sampler
-
-
-class DistributedModelManager:
-    """Model preparation and management class for distributed training."""
-
-    def __init__(self, num_classes: int, rank: int):
-        self.num_classes = num_classes
-        self.rank = rank
-        self.device = torch.device(f"cuda:{rank}")
-
-    def prepare_model(self):
-        """Prepare and modify the model for distributed training."""
-        model = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1)
-        model.classifier[3] = nn.Linear(model.classifier[3].in_features, self.num_classes)
-        model = model.to(self.device)
-        model = DDP(model, device_ids=[self.rank])
-        return model
-
-    @staticmethod
-    def prepare_training_components(model, learning_rate=1e-4):
-        """Prepare training components."""
-        criterion = nn.CrossEntropyLoss()
-        optimizer = Lion(model.parameters(), lr=learning_rate, weight_decay=1e-2)
-        scheduler = StepLR(optimizer, step_size=1, gamma=0.1)
-        return criterion, optimizer, scheduler
-
-
-def setup_logging():
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('training.log')
-        ]
-    )
-
-
-def setup_distributed(rank, world_size, master_port='12355'):
-    """Initialize distributed training."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = master_port
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-
-def cleanup_distributed():
-    """Clean up distributed training."""
-    dist.destroy_process_group()
-
-
-def train_process(rank, world_size):
-    """Training process for each GPU."""
+    Args:
+        rank (int): Current process rank
+        world_size (int): Total number of processes
+        config (Config): Configuration object containing all training parameters
+    """
+    # 분산 학습 설정
     setup_distributed(rank, world_size)
-    logger = logging.getLogger(f"Trainer-{rank}")
+    logger = setup_logging(rank)
 
     try:
-        # Initialize managers
-        dataset_manager = DistributedDatasetManager(
-            train_path="D:/4type_weather_driving_dataset/Training",
-            valid_path="D:/4type_weather_driving_dataset/Validation"
-        )
-        model_manager = DistributedModelManager(num_classes=5, rank=rank)
+        logger.info(f"Initializing process rank {rank}/{world_size - 1}")
 
-        # Prepare datasets and dataloaders
-        train_dataset, val_dataset = dataset_manager.prepare_datasets(train_ratio=0.8)
-        train_loader, valid_loader, train_sampler, valid_sampler = dataset_manager.create_dataloaders(
-            train_dataset, val_dataset, rank, world_size
+        # 데이터셋 매니저 초기화
+        dataset_manager = DistributedDatasetManager(
+            train_path=config.dataset['train_path'],
+            valid_path=config.dataset['valid_path'],
+            batch_size=config.dataset['batch_size'],
+            num_workers=config.dataset['num_workers']
         )
+
+        # 데이터셋과 로더 준비
+        logger.info("Preparing datasets and dataloaders...")
+        train_dataset, val_dataset = dataset_manager.prepare_datasets(
+            train_ratio=config.training['train_ratio']
+        )
+        train_loader, valid_loader, train_sampler, valid_sampler = \
+            dataset_manager.create_dataloaders(
+                train_dataset, val_dataset, rank, world_size
+            )
 
         if rank == 0:
-            logger.info(f"Dataset sizes - Train: {len(train_dataset)}, Validation: {len(val_dataset)}")
+            logger.info(f"Total training samples: {len(train_dataset)}")
+            logger.info(f"Total validation samples: {len(val_dataset)}")
 
-        # Prepare model and training components
-        model = model_manager.prepare_model()
-        criterion, optimizer, scheduler = model_manager.prepare_training_components(model)
+        # 모델 매니저 초기화 및 모델 준비
+        logger.info("Initializing model...")
+        model_manager = DistributedModelManager(
+            num_classes=config.model['num_classes'],
+            rank=rank,
+            sync_bn=config.model.get('sync_bn', True)
+        )
 
-        # Initialize trainer
-        trainer = ModelTrainer(
+        # 모델 생성
+        model = create_model(
+            model_name=config.model['name'],
+            num_classes=config.model['num_classes'],
+            pretrained=config.model.get('pretrained', True)
+        )
+
+        # 체크포인트에서 모델 로드 (있는 경우)
+        if config.training.get('resume_from_checkpoint'):
+            checkpoint_path = config.training['checkpoint_path']
+            logger.info(f"Loading checkpoint from {checkpoint_path}")
+            model = model_manager.load_checkpoint(model, checkpoint_path)
+            if model is None:
+                logger.error("Failed to load checkpoint. Starting from scratch.")
+                model = create_model(
+                    model_name=config.model['name'],
+                    num_classes=config.model['num_classes'],
+                    pretrained=config.model.get('pretrained', True)
+                )
+
+        # 모델을 분산 학습용으로 준비
+        model = model_manager.prepare_model(model)
+
+        # Loss function 정의
+        criterion = nn.CrossEntropyLoss().to(rank)
+
+        # Optimizer 설정
+        optimizer = create_optimizer(
+            model=model,
+            optimizer_name=config.training['optimizer'],
+            learning_rate=config.training['learning_rate'],
+            weight_decay=config.training['weight_decay']
+        )
+
+        # Learning rate scheduler 설정
+        scheduler = create_scheduler(
+            optimizer=optimizer,
+            scheduler_name=config.training['scheduler'],
+            **config.training['scheduler_params']
+        )
+
+        # AMP scaler 초기화
+        scaler = GradScaler()
+
+        # Trainer 초기화
+        trainer = DistributedModelTrainer(
             model=model,
             criterion=criterion,
             optimizer=optimizer,
             scheduler=scheduler,
-            device=model_manager.device,
-            save_path='checkpoints',
-            model_name=f'mobilenet_v3_weather_gpu{rank}'
+            device=torch.device(f"cuda:{rank}"),
+            save_path=config.paths['checkpoints'],
+            model_name=f"{config.model['name']}_rank{rank}"
         )
 
-        # Start training
+        # Training 시작
         if rank == 0:
-            logger.info("Starting distributed training...")
+            logger.info("Starting training...")
+            logger.info(f"Training configuration:")
+            logger.info(f"- Epochs: {config.training['num_epochs']}")
+            logger.info(f"- Batch size: {config.dataset['batch_size']}")
+            logger.info(f"- Learning rate: {config.training['learning_rate']}")
+            logger.info(f"- Optimizer: {config.training['optimizer']}")
+            logger.info(f"- Scheduler: {config.training['scheduler']}")
 
         trainer.train(
             train_loader=train_loader,
             valid_loader=valid_loader,
-            num_epochs=50,
+            num_epochs=config.training['num_epochs'],
             train_sampler=train_sampler,
             valid_sampler=valid_sampler
         )
@@ -177,30 +137,34 @@ def train_process(rank, world_size):
             logger.info("Training completed successfully!")
 
     except Exception as e:
-        logger.error(f"An error occurred on GPU {rank}: {str(e)}", exc_info=True)
+        logger.error(f"Error in rank {rank}: {str(e)}", exc_info=True)
+        raise  # Re-raise the exception for proper error handling
     finally:
         cleanup_distributed()
+        logger.info(f"Process {rank} finished")
 
 
 def main():
-    # Setup logging
-    setup_logging()
-    logger = logging.getLogger(__name__)
+    # 환경 변수 로드
+    load_dotenv()
 
-    # Set master GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = '2,3,4,5'  # GPU 2,3,4,5를 0,1,2,3으로 매핑
-    world_size = 4  # 사용할 GPU 개수
+    # 설정 로드
+    config = Config()
+
+    # GPU 설정
+    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, config.training['gpus']))
+    world_size = len(config.training['gpus'])
 
     try:
-        # Start distributed training
+        # 분산 학습 시작
         mp.spawn(
             train_process,
-            args=(world_size,),
+            args=(world_size, config),
             nprocs=world_size,
             join=True
         )
     except Exception as e:
-        logger.error(f"An error occurred in main process: {str(e)}", exc_info=True)
+        print(f"An error occurred in main process: {str(e)}")
 
 
 if __name__ == '__main__':
