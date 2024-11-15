@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from PIL import Image, ImageFile
 from torchvision import transforms
-from torchvision.models.mobilenetv3 import mobilenet_v3_small
+from torchvision.models.mobilenetv3 import mobilenet_v3_small, mobilenet_v3_large
 from torchvision.models.efficientnet import efficientnet_b2, efficientnet_v2_s
 from tqdm import tqdm
 
@@ -46,9 +46,9 @@ def load_images(image_paths, transform):
 
 if __name__ == '__main__':
     # Load the trained model
-    model_path = 'model/model_epoch_28.pth'  # Update this path
-    model = mobilenet_v3_small(weights=None)
-    num_classes = 5
+    model_path = 'checkpoints/mobilenetv3_large_rank0_epoch_22.pth'  # Update this path
+    model = mobilenet_v3_large(weights=None)
+    num_classes = 4
     model.classifier[3] = nn.Linear(model.classifier[3].in_features, num_classes)
     model.load_state_dict(torch.load(model_path))
 
@@ -56,13 +56,13 @@ if __name__ == '__main__':
     model.to(device)
 
     # Class names (update as per your dataset)
-    class_names = ['0', '1', '2', '3', '4']
+    class_names = ['Hazy', 'Normal', 'Rainy', 'Snowy']
 
     # Transform
     transform = test_transform()
 
     # Directory containing images
-    image_directory = './data/val/*'  # Update this path
+    image_directory = '/media/mvw/new-volumn/4type_weather_driving_dataset/Validation/*'  # Update this path
     image_paths = glob(os.path.join(image_directory, '*.jpg'))
 
     # Batch size

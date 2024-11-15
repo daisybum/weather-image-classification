@@ -48,7 +48,7 @@ def train_process(rank: int, world_size: int, config: Config):
                 train_dataset, val_dataset, rank, world_size
             )
 
-        if rank == 0:
+        if rank == 2:
             logger.info(f"Total training samples: {len(train_dataset)}")
             logger.info(f"Total validation samples: {len(val_dataset)}")
 
@@ -116,7 +116,7 @@ def train_process(rank: int, world_size: int, config: Config):
         )
 
         # Training 시작
-        if rank == 0:
+        if rank == 2:
             logger.info("Starting training...")
             logger.info(f"Training configuration:")
             logger.info(f"- Epochs: {config.training['num_epochs']}")
@@ -133,7 +133,7 @@ def train_process(rank: int, world_size: int, config: Config):
             valid_sampler=valid_sampler
         )
 
-        if rank == 0:
+        if rank == 2:
             logger.info("Training completed successfully!")
 
     except Exception as e:

@@ -136,3 +136,4 @@ model/
 *.parquet
 *.csv
 *.json
+*.pth
